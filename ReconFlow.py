@@ -5,6 +5,7 @@ import os
 import urllib3
 import random
 import warnings
+import logging  # Added for logging
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,13 +16,22 @@ from threading import Lock
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# --- NEW: Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("reconflow.log"),  # Saves all logs to this file
+        logging.StreamHandler()              # Prints logs to console
+    ]
+)
+logger = logging.getLogger(__name__)
+
 class ReconFlow:
     def __init__(self, proxy_list=None):
-        # Current stable Common Crawl Index
         self.cc_index = "CC-MAIN-2026-04" 
         self.api_url = f"http://index.commoncrawl.org/{self.cc_index}-index"
         
-        # Universal Keywords
         self.keywords = ['login', 'signin', 'auth', 'admin', 'portal', 'dashboard', 'account', 'register']
         self.blacklist = ('.jpg', '.png', '.css', '.js', '.pdf', '.svg', '.zip', '.docx', '.gif')
         self.noise_words = ['/news/', '/blog/', '/help/', '/faq/', '/terms/', '/privacy/']
@@ -35,18 +45,23 @@ class ReconFlow:
         self.lock_manager = Lock()
         self.delay_per_domain = 1.0 
         self.total_portals_found = 0
+        logger.info(f"ReconFlow initialized using index: {self.cc_index}")
 
     def _load_progress_dict(self):
         if os.path.exists(self.state_file):
             with open(self.state_file, 'r') as f:
                 try: return json.load(f)
-                except: return {}
+                except Exception as e:
+                    logger.error(f"Failed to load state file: {e}")
+                    return {}
         return {}
 
     def _get_folder(self, query):
         clean_name = query.replace("*", "").replace("/", "").replace(".", "_").strip("_")
         folder_name = f"recon_{clean_name}"
-        if not os.path.exists(folder_name): os.makedirs(folder_name)
+        if not os.path.exists(folder_name): 
+            os.makedirs(folder_name)
+            logger.info(f"Created results folder: {folder_name}")
         return folder_name
 
     def run_discovery(self, query, record_limit=500):
@@ -62,35 +77,46 @@ class ReconFlow:
 
         page = self.query_progress.get(query, 0)
         total_saved = 0
-        print(f"\n[*] Mining: {query} | Page: {page}")
+        logger.info(f"Starting discovery for {query} at CC Page {page}")
 
         with open(raw_path, "a") as f:
             while True:
                 if record_limit > 0 and total_saved >= record_limit: break
                 params = {'url': query, 'output': 'json', 'fl': 'url', 'page': page}
                 try:
-                    resp = requests.get(self.api_url, params=params, timeout=20)
-                    if resp.status_code == 404: break
-                    if resp.status_code != 200: time.sleep(5); continue
+                    resp = requests.get(self.api_url, params=params, timeout=25)
+                    if resp.status_code == 404:
+                        logger.warning(f"No more data for {query} (404 reached).")
+                        break
+                    if resp.status_code != 200:
+                        logger.error(f"CC API Error {resp.status_code}. Retrying in 5s...")
+                        time.sleep(5); continue
 
-                    for line in resp.text.splitlines():
-                        url = json.loads(line).get('url', '').lower()
-                        if any(k in url for k in self.keywords) and not url.endswith(self.blacklist):
-                            p = urlparse(url); sig = f"{p.netloc}{p.path}"
-                            if sig not in seen_sigs:
-                                seen_sigs.add(sig); f.write(url + "\n")
-                                total_saved += 1
+                    lines = resp.text.splitlines()
+                    for line in lines:
+                        try:
+                            url = json.loads(line).get('url', '').lower()
+                            if any(k in url for k in self.keywords) and not url.endswith(self.blacklist):
+                                p = urlparse(url); sig = f"{p.netloc}{p.path}"
+                                if sig not in seen_sigs:
+                                    seen_sigs.add(sig); f.write(url + "\n")
+                                    total_saved += 1
+                        except: continue
                     
+                    logger.info(f"Page {page} complete. Total discovered for this query: {total_saved}")
                     page += 1
                     self.query_progress[query] = page
                     with open(self.state_file, 'w') as sf: json.dump(self.query_progress, sf)
-                except: break
+                    time.sleep(1) # Politely throttle CC API requests
+                except Exception as e:
+                    logger.error(f"Discovery interrupted: {e}")
+                    break
 
     def _check_url_life(self, target_url):
         p = urlparse(target_url)
         self._smart_delay(p.netloc)
         
-        # Phase 1: Direct
+        # 1. Direct
         try:
             r = requests.get(target_url, headers=self.headers, timeout=6, verify=False, allow_redirects=True)
             if r.status_code == 200:
@@ -99,9 +125,9 @@ class ReconFlow:
                 return ("PORTAL" if is_form else "LIVE"), True
         except: pass
 
-        # Phase 2: Proxy Retries
+        # 2. Proxy Retries
         if self.proxy_pool:
-            for _ in range(2):
+            for attempt in range(2):
                 try:
                     px = random.choice(self.proxy_pool)
                     r = requests.get(target_url, proxies={"http":px, "https":px}, headers=self.headers, timeout=10, verify=False)
@@ -132,14 +158,20 @@ class ReconFlow:
                 for line in f:
                     if "|" in line: history.add(line.split("|")[1].strip())
 
-        if not os.path.exists(raw_path): return
+        if not os.path.exists(raw_path): 
+            logger.warning(f"No URLs found to validate for {query}")
+            return
+        
         with open(raw_path, "r") as f:
             all_urls = list(set(line.strip() for line in f if line.strip()))
 
         to_validate = [u for u in all_urls if u not in history and not any(n in u for n in self.noise_words)]
-        if not to_validate: return
+        if not to_validate:
+            logger.info(f"No new URLs to validate for {query}")
+            return
 
-        pbar = tqdm(total=len(to_validate), desc=f"Scanning {query[:20]}", ncols=70)
+        logger.info(f"Validating {len(to_validate)} URLs for {query}...")
+        pbar = tqdm(total=len(to_validate), desc=f"Scanning {query[:15]}", ncols=70, disable=False)
 
         with open(log_path, "a") as log_f, open(gold_path, "a") as gold_f, open(subs_path, "a") as sub_f:
             seen_subs = set()
@@ -159,32 +191,30 @@ class ReconFlow:
                                 gold_f.write(url + "\n")
                                 self.total_portals_found += 1
                             log_f.flush()
-                    except: pass
+                    except Exception as e:
+                        logger.debug(f"Error validating {url}: {e}")
                     finally: pbar.update(1)
         pbar.close()
 
 if __name__ == "__main__":
-    # 1. Setup Proxies
     my_proxies = ["socks5h://127.0.0.1:31080"]
     bot = ReconFlow(proxy_list=my_proxies)
     
-    # 2. Load Targets from File
-    # Create 'targets.txt' and add lines like: *.edu/*, *.com/login*, etc.
     targets_file = "targets.txt"
     if not os.path.exists(targets_file):
-        with open(targets_file, "w") as f: f.write("*.edu/*\n*.org/admin*")
-        print(f"[*] Created {targets_file}. Please add your target patterns and restart.")
+        with open(targets_file, "w") as f: f.write("*.edu/*\n")
+        logger.info(f"Created {targets_file}. Add targets and restart.")
     else:
         with open(targets_file, "r") as f:
             queries = [line.strip() for line in f if line.strip()]
         
+        logger.info(f"Loaded {len(queries)} target queries.")
         start_time = time.time()
-        print (queries)
+        
         for q in queries:
-            bot.run_discovery(q, record_limit=200)
+            bot.run_discovery(q, record_limit=300)
             bot.run_validation(q, threads=25)
         
-        end_time = time.time()
-        duration = round((end_time - start_time) / 60, 2)
-        print(f"\n[!] Mission Complete in {duration} minutes.")
-        print(f"[!] Total Portals Harvested: {bot.total_portals_found}")
+        duration = round((time.time() - start_time) / 60, 2)
+        logger.info(f"Mission Complete in {duration} minutes.")
+        logger.info(f"Total Portals Harvested: {bot.total_portals_found}")
